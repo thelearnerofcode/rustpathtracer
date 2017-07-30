@@ -5,4 +5,5 @@ Inspired by [smallpt](http://www.kevinbeason.com/smallpt/) and this [tutorial](h
 
 MIT licensed.
 
+Supports psuedo-cell shading.
 
