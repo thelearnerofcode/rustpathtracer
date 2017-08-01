@@ -1,7 +1,6 @@
 extern crate nalgebra;
 extern crate image;
 extern crate rand;
-extern crate cpuprofiler;
 extern crate crossbeam;
 extern crate imageproc;
 
@@ -13,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nalgebra::Vector3;
-use image::{DynamicImage, GenericImage, Pixel, Rgba};
+use image::{DynamicImage, GenericImage, ImageBuffer, Pixel, Rgba};
 use rand::distributions::{IndependentSample, Range};
 
 const GAMMA: f32 = 2.2;
@@ -440,8 +439,8 @@ impl Scene {
             .filter_map(|s| s.intersect(ray).map(|d| Intersection::new(d, s, ray)))
             .min_by(|i1, i2| i1.distance.partial_cmp(&i2.distance).unwrap())
     }
-
-    pub fn cast_ray(&self, ray: &Ray, depth: u64) -> Color {
+    // returns color of final object and the normal
+    pub fn cast_ray(&self, ray: &Ray, depth: u64) -> (Color, Color) {
         let intersection_option = self.trace(ray);
         match intersection_option {
             Some(intersection) => {
@@ -470,19 +469,24 @@ impl Scene {
                     if (between.ind_sample(&mut rng) as f32) < p {
                         color = objcolor * (1.0 / p)
                     } else {
-                        return emission;
+                        return (emission, Color::black());
                     }
                 } else {
                     color = objcolor;
                 };
                 // check if intersected with edge
                 if intersection.object.intersect_edge(&ray) {
-                    color = color * 0.05;
+                    color = Color::black();
                 }
 
                 // calculate normal
                 let normal = intersection.object.surface_normal(&intersection.hit_point);
                 let oriented_normal = orient_normal(&normal, &ray);
+                let normal_as_color = Color {
+                    red: normal.x as f32,
+                    green: normal.y as f32,
+                    blue: normal.z as f32,
+                };
 
                 match material.material_type {
                     MaterialType::Diffuse => {
@@ -502,7 +506,7 @@ impl Scene {
                         };
                         let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
 
-                        emission + color * reflected_color
+                        (emission + color * reflected_color.0, normal_as_color)
                     }
                     MaterialType::Specular => {
                         let reflected_ray = Ray {
@@ -510,7 +514,7 @@ impl Scene {
                             origin: intersection.hit_point + (oriented_normal * self.bias),
                         };
                         let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-                        emission + color * reflected_color
+                        (emission + color * reflected_color.0, normal_as_color)
                     }
                     MaterialType::Metal => {
                         let phi = 2.0 * f64::consts::PI * between.ind_sample(&mut rng);
@@ -532,11 +536,11 @@ impl Scene {
                         };
 
                         let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-                        emission + color * reflected_color
+                        (emission + color * reflected_color.0, normal_as_color)
                     }
                     MaterialType::Coat => {
                         let random_float = between.ind_sample(&mut rng);
-                        let threshold = 0.05;
+                        let threshold = 0.1;
                         let reflect_from_surface = random_float < threshold;
                         if reflect_from_surface {
                             let reflected_ray = Ray {
@@ -545,7 +549,7 @@ impl Scene {
                                 origin: intersection.hit_point + (oriented_normal * self.bias),
                             };
                             let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-                            emission + color * reflected_color
+                            (emission + color * reflected_color.0, normal_as_color)
                         } else {
                             let r1 = 2.0 * f64::consts::PI * between.ind_sample(&mut rng);
                             let r2 = between.ind_sample(&mut rng);
@@ -563,35 +567,39 @@ impl Scene {
                             };
                             let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
 
-                            emission + color * reflected_color
+                            (emission + color * reflected_color.0, normal_as_color)
                         }
                     }
                 }
             }
-            None => Color::white(),
+            None => (Color::white(), Color::black()),
         }
     }
 
-    fn render_pixel(&self, x: u32, y: u32) -> Color {
+    fn render_pixel(&self, x: u32, y: u32) -> (Color, Color) {
         let mut final_color = Color::black();
+        let mut normal = Color::black();
         for _ in 0..self.samples {
             let ray = Ray::create_prime(x, y, self);
-            final_color = final_color + self.cast_ray(&ray, 0);
+            let casted_ray_val = self.cast_ray(&ray, 0);
+            final_color = final_color + casted_ray_val.0;
+            normal = normal + casted_ray_val.1;
         }
-        final_color / self.samples
+        (final_color / self.samples, normal / self.samples)
     }
 
     pub fn render(&self) -> DynamicImage {
         // create progress bar
         let total_pixels = self.width * self.height;
         // pixel_data stores the position and color of each pixel
-        let pixel_data: Arc<Mutex<Vec<(u32, u32, Color)>>> =
+        let pixel_data: Arc<Mutex<Vec<(u32, u32, (Color, Color))>>> =
             Arc::new(Mutex::new(Vec::with_capacity(total_pixels as usize)));
 
         crossbeam::scope(|scope| for x in 0..self.width {
             let pixel_data = Arc::clone(&pixel_data);
             scope.spawn(move || {
-                let mut row: Vec<(u32, u32, Color)> = Vec::with_capacity(self.height as usize);
+                let mut row: Vec<(u32, u32, (Color, Color))> =
+                    Vec::with_capacity(self.height as usize);
                 for y in 0..self.height {
                     // render pixel
                     let color = self.render_pixel(x, y);
@@ -601,19 +609,55 @@ impl Scene {
                 // increase progress bar
             });
         });
-        let mut image = DynamicImage::new_rgb8(self.width, self.height);
+        let mut colors = DynamicImage::new_rgb8(self.width, self.height);
+        let mut normal_image = DynamicImage::new_rgb8(self.width, self.height);
         let pixel_data = pixel_data.lock().unwrap();
-        for &(x, y, color) in pixel_data.iter() {
-            image.put_pixel(x, y, color.to_rgba());
+        for &(x, y, (color, normal)) in pixel_data.iter() {
+            colors.put_pixel(x, y, color.to_rgba());
+            normal_image.put_pixel(x, y, normal.to_rgba());
         }
-        image
+        // now time for processing
+        let mut gradient = imageproc::gradients::sobel_gradients(&normal_image.to_luma());
+        // convert gradient from ImageBuffer<u16> to ImageBuffer<u8>
+        let mut tmp_gradient: image::ImageBuffer<image::Luma<u8>, std::vec::Vec<u8>> =
+            ImageBuffer::new(self.width, self.height);
+        for x in 0..self.width {
+            for y in 0..self.height {
+                let u16_pixel = gradient.get_pixel(x, y);
+                let channels = u16_pixel.channels4();
+                let u8_pixel = image::Luma::from_channels(
+                    channels.0 as u8,
+                    channels.1 as u8,
+                    channels.2 as u8,
+                    channels.3 as u8,
+                );
+                tmp_gradient.put_pixel(x, y, u8_pixel);
+            }
+        }
+        let mut gradient = image::ImageRgb8(image::ImageLuma8(tmp_gradient).to_rgb());
+        gradient.invert();
+
+        // add all layers together
+        let mut final_image = DynamicImage::new_rgb8(self.width, self.height);
+        for x in 0..self.width {
+            for y in 0..self.height {
+                    let final_pixel_color = imageproc::pixelops::weighted_sum(
+                        colors.get_pixel(x, y),
+                        gradient.get_pixel(x, y),
+                        0.9,
+                        0.1,
+                    );
+                final_image.put_pixel(x, y, final_pixel_color)
+            }
+        }
+        final_image
     }
 }
 
 fn main() {
     let scene = Scene {
-        width: 1920,
-        height: 1080,
+        width: 7680,
+        height: 4320,
         fov: 45.0,
         objects: vec![
             // black sphere
@@ -635,7 +679,7 @@ fn main() {
                     material: Material {
                         color: Color::new(0.529411764706, 0.807843137255, 0.980392156863),
                         emission: Color::black(),
-                        material_type: MaterialType::Specular,
+                        material_type: MaterialType::Coat,
                     },
                     edge_size: 0.015,
                 },
@@ -648,7 +692,7 @@ fn main() {
                     material: Material {
                         color: Color::white() * 0.1,
                         emission: Color::black(),
-                        material_type: MaterialType::Coat,
+                        material_type: MaterialType::Diffuse,
                     },
                 },
             ),
@@ -680,6 +724,8 @@ fn main() {
     let now = Instant::now();
     let img: DynamicImage = scene.render();
     println!("Completed in {} seconds.", now.elapsed().as_secs());
+
+
 
     let file_name = "render_test1.png";
     let ref mut fout = File::create(&Path::new(&file_name)).unwrap();

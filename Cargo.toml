@@ -7,10 +7,8 @@ authors = ["owen"]
 nalgebra = "0.12.3"
 image = "0.14.0"
 rand = "0.3"
-cpuprofiler = "0.0.2"
 crossbeam = "0.2"
 imageproc = "0.9.0"
-
 
 [profile.release]
 debug = true
