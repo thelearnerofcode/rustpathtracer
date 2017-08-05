@@ -1,35 +1,34 @@
 extern crate nalgebra;
 extern crate image;
 extern crate rand;
-extern crate crossbeam;
-extern crate imageproc;
-
+extern crate scoped_threadpool;
 use std::path::Path;
 use std::fs::File;
 use std::ops::{Add, AddAssign, Div, Mul};
-use std::{f32, f64};
+use std::f64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use scoped_threadpool::Pool;
 
 use nalgebra::Vector3;
 use image::{DynamicImage, GenericImage, ImageBuffer, Pixel, Rgba};
 use rand::distributions::{IndependentSample, Range};
 
-const GAMMA: f32 = 2.2;
+const GAMMA: f64 = 2.2;
 
-fn gamma_encode(linear: f32) -> f32 {
+fn gamma_encode(linear: f64) -> f64 {
     linear.powf(1.0 / GAMMA)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
-    pub red: f32,
-    pub green: f32,
-    pub blue: f32,
+    pub red: f64,
+    pub green: f64,
+    pub blue: f64,
 }
 
 impl Color {
-    pub fn new(red: f32, green: f32, blue: f32) -> Color {
+    pub fn new(red: f64, green: f64, blue: f64) -> Color {
         Color {
             red: red,
             green: green,
@@ -92,9 +91,9 @@ impl Mul for Color {
     }
 }
 
-impl Mul<f32> for Color {
+impl Mul<f64> for Color {
     type Output = Color;
-    fn mul(self, other: f32) -> Color {
+    fn mul(self, other: f64) -> Color {
         Color {
             red: self.red * other,
             green: self.green * other,
@@ -103,36 +102,13 @@ impl Mul<f32> for Color {
     }
 }
 
-impl Mul<f64> for Color {
-    type Output = Color;
-    fn mul(self, other: f64) -> Color {
-        Color {
-            red: self.red * other as f32,
-            green: self.green * other as f32,
-            blue: self.blue * other as f32,
-        }
-    }
-}
-
 impl Mul<Color> for f64 {
     type Output = Color;
     fn mul(self, other: Color) -> Color {
         Color {
-            red: other.red * self as f32,
-            green: other.green * self as f32,
-            blue: other.blue * self as f32,
-        }
-    }
-}
-
-impl Div<f32> for Color {
-    type Output = Color;
-
-    fn div(self, other: f32) -> Color {
-        Color {
-            red: self.red / other,
-            green: self.green / other,
-            blue: self.blue / other,
+            red: other.red * self,
+            green: other.green * self,
+            blue: other.blue * self,
         }
     }
 }
@@ -142,9 +118,20 @@ impl Div<f64> for Color {
 
     fn div(self, other: f64) -> Color {
         Color {
-            red: self.red / other as f32,
-            green: self.green / other as f32,
-            blue: self.blue / other as f32,
+            red: self.red / other,
+            green: self.green / other,
+            blue: self.blue / other,
+        }
+    }
+}
+impl Div<Color> for f64 {
+    type Output = Color;
+
+    fn div(self, color: Color) -> Color {
+        Color {
+            red: color.red / self,
+            green: color.green / self,
+            blue: color.blue / self,
         }
     }
 }
@@ -153,9 +140,9 @@ impl Div<i32> for Color {
 
     fn div(self, other: i32) -> Color {
         Color {
-            red: self.red / other as f32,
-            green: self.green / other as f32,
-            blue: self.blue / other as f32,
+            red: self.red / other as f64,
+            green: self.green / other as f64,
+            blue: self.blue / other as f64,
         }
     }
 }
@@ -165,7 +152,6 @@ pub enum MaterialType {
     Specular,
     Diffuse,
     Metal,
-    Coat,
 }
 
 #[derive(Debug)]
@@ -202,14 +188,14 @@ impl Plane {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Ray {
     pub origin: Vector3<f64>,
     pub direction: Vector3<f64>,
 }
 
 impl Ray {
-    pub fn create_prime(x: u32, y: u32, scene: &Scene) -> Ray {
+    pub fn create_prime(x: f64, y: f64, scene: &Scene) -> Ray {
         let fov_adjustment = (scene.fov.to_radians() / 2.0).tan();
         let aspect_ratio = (scene.width as f64) / (scene.height as f64);
         let sensor_x =
@@ -356,7 +342,7 @@ trait LightTrait {
 pub struct DistantLight {
     pub direction: Vector3<f64>,
     pub color: Color,
-    pub intensity: f32,
+    pub intensity: f64,
 }
 
 impl LightTrait for DistantLight {
@@ -372,7 +358,7 @@ impl LightTrait for DistantLight {
 pub struct PointLight {
     pub position: Vector3<f64>,
     pub color: Color,
-    pub intensity: f32,
+    pub intensity: f64,
 }
 
 impl LightTrait for PointLight {
@@ -408,6 +394,7 @@ pub struct Scene {
     pub lights: Vec<Light>,
     pub samples: i32,
     pub bias: f64,
+    pub max_depth: u64,
 }
 
 fn orient_normal(normal: &Vector3<f64>, ray: &Ray) -> Vector3<f64> {
@@ -454,7 +441,7 @@ impl Scene {
                 let emission = material.emission;
 
                 // calculate max reflection
-                let p: f32;
+                let p: f64;
                 if objcolor.red > objcolor.green && objcolor.red > objcolor.blue {
                     p = objcolor.red;
                 } else {
@@ -464,9 +451,10 @@ impl Scene {
                         p = objcolor.blue;
                     }
                 }
-                let mut color: Color;
-                if depth > 5 {
-                    if (between.ind_sample(&mut rng) as f32) < p {
+
+                let color: Color;
+                if depth > 4 {
+                    if (between.ind_sample(&mut rng)) < p {
                         color = objcolor * (1.0 / p)
                     } else {
                         return (emission, Color::black());
@@ -474,20 +462,19 @@ impl Scene {
                 } else {
                     color = objcolor;
                 };
-                // check if intersected with edge
-                if intersection.object.intersect_edge(&ray) {
-                    color = Color::black();
+                if depth > self.max_depth && self.max_depth > 0 {
+                    return (emission, Color::black());
                 }
 
                 // calculate normal
                 let normal = intersection.object.surface_normal(&intersection.hit_point);
                 let oriented_normal = orient_normal(&normal, &ray);
                 let normal_as_color = Color {
-                    red: normal.x as f32,
-                    green: normal.y as f32,
-                    blue: normal.z as f32,
+                    red: normal.x,
+                    green: normal.y,
+                    blue: normal.z,
                 };
-
+                let reflected_ray: Ray;
                 match material.material_type {
                     MaterialType::Diffuse => {
                         let r1 = 2.0 * f64::consts::PI * between.ind_sample(&mut rng);
@@ -500,21 +487,18 @@ impl Scene {
                             (oriented_normal * (1.0 - r2).sqrt()))
                             .normalize();
 
-                        let reflected_ray = Ray {
+                        reflected_ray = Ray {
                             direction: direction,
                             origin: intersection.hit_point + (oriented_normal * self.bias),
                         };
-                        let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
 
-                        (emission + color * reflected_color.0, normal_as_color)
                     }
                     MaterialType::Specular => {
-                        let reflected_ray = Ray {
+                        reflected_ray = Ray {
                             direction: ray.direction - normal * 2.0 * normal.dot(&ray.direction),
                             origin: intersection.hit_point + (oriented_normal * self.bias),
                         };
-                        let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-                        (emission + color * reflected_color.0, normal_as_color)
+
                     }
                     MaterialType::Metal => {
                         let phi = 2.0 * f64::consts::PI * between.ind_sample(&mut rng);
@@ -529,48 +513,17 @@ impl Scene {
 
                         let (u, v) = create_coordinate_system(w);
 
-                        let reflected_ray = Ray {
+                        reflected_ray = Ray {
                             direction: u * phi.cos() * sin_theta + v * phi.sin() * sin_theta +
                                 oriented_normal * cos_theta,
                             origin: intersection.hit_point + (oriented_normal * self.bias),
                         };
-
-                        let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-                        (emission + color * reflected_color.0, normal_as_color)
                     }
-                    MaterialType::Coat => {
-                        let random_float = between.ind_sample(&mut rng);
-                        let threshold = 0.1;
-                        let reflect_from_surface = random_float < threshold;
-                        if reflect_from_surface {
-                            let reflected_ray = Ray {
-                                direction: ray.direction -
-                                    normal * 2.0 * normal.dot(&ray.direction),
-                                origin: intersection.hit_point + (oriented_normal * self.bias),
-                            };
-                            let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-                            (emission + color * reflected_color.0, normal_as_color)
-                        } else {
-                            let r1 = 2.0 * f64::consts::PI * between.ind_sample(&mut rng);
-                            let r2 = between.ind_sample(&mut rng);
-                            let r2s = r2.sqrt();
-
-                            let (u, v) = create_coordinate_system(oriented_normal.normalize());
-
-                            let direction = ((u * r1.cos() * r2s) + (v * r1.sin() * r2s) +
-                                (oriented_normal * (1.0 - r2).sqrt()))
-                                .normalize();
-
-                            let reflected_ray = Ray {
-                                direction: direction,
-                                origin: intersection.hit_point + (oriented_normal * self.bias),
-                            };
-                            let reflected_color = self.cast_ray(&reflected_ray, depth + 1);
-
-                            (emission + color * reflected_color.0, normal_as_color)
-                        }
-                    }
-                }
+                };
+                let indirect_lighting =
+                    self.cast_ray(&reflected_ray, depth + 1).0;
+                let hit_color = (f64::consts::PI / emission) + color * indirect_lighting;
+                (hit_color, normal_as_color)
             }
             None => (Color::white(), Color::black()),
         }
@@ -579,8 +532,15 @@ impl Scene {
     fn render_pixel(&self, x: u32, y: u32) -> (Color, Color) {
         let mut final_color = Color::black();
         let mut normal = Color::black();
+        // gen rng
+        let between = Range::new(-0.5f64, 0.5f64);
+        let mut rng = rand::thread_rng();
         for _ in 0..self.samples {
-            let ray = Ray::create_prime(x, y, self);
+            let ray = Ray::create_prime(
+                x as f64 + between.ind_sample(&mut rng),
+                y as f64 + between.ind_sample(&mut rng),
+                self,
+            );
             let casted_ray_val = self.cast_ray(&ray, 0);
             final_color = final_color + casted_ray_val.0;
             normal = normal + casted_ray_val.1;
@@ -589,26 +549,28 @@ impl Scene {
     }
 
     pub fn render(&self) -> DynamicImage {
-        // create progress bar
         let total_pixels = self.width * self.height;
         // pixel_data stores the position and color of each pixel
         let pixel_data: Arc<Mutex<Vec<(u32, u32, (Color, Color))>>> =
             Arc::new(Mutex::new(Vec::with_capacity(total_pixels as usize)));
+        let mut pool = Pool::new(4);
 
-        crossbeam::scope(|scope| for x in 0..self.width {
-            let pixel_data = Arc::clone(&pixel_data);
-            scope.spawn(move || {
-                let mut row: Vec<(u32, u32, (Color, Color))> =
-                    Vec::with_capacity(self.height as usize);
-                for y in 0..self.height {
-                    // render pixel
-                    let color = self.render_pixel(x, y);
-                    row.push((x, y, color));
-                }
-                pixel_data.lock().unwrap().extend(row.as_slice());
-                // increase progress bar
-            });
+        pool.scoped(|scope| {
+            for x in 0..self.width {
+                let pixel_data = Arc::clone(&pixel_data);
+                scope.execute(move || {
+                    let mut row: Vec<(u32, u32, (Color, Color))> =
+                        Vec::with_capacity(self.height as usize);
+                    for y in 0..self.height {
+                        // render pixel
+                        let color = self.render_pixel(x, y);
+                        row.push((x, y, color));
+                    }
+                    pixel_data.lock().unwrap().extend(row.as_slice());
+                });
+            }
         });
+
         let mut colors = DynamicImage::new_rgb8(self.width, self.height);
         let mut normal_image = DynamicImage::new_rgb8(self.width, self.height);
         let pixel_data = pixel_data.lock().unwrap();
@@ -616,48 +578,14 @@ impl Scene {
             colors.put_pixel(x, y, color.to_rgba());
             normal_image.put_pixel(x, y, normal.to_rgba());
         }
-        // now time for processing
-        let mut gradient = imageproc::gradients::sobel_gradients(&normal_image.to_luma());
-        // convert gradient from ImageBuffer<u16> to ImageBuffer<u8>
-        let mut tmp_gradient: image::ImageBuffer<image::Luma<u8>, std::vec::Vec<u8>> =
-            ImageBuffer::new(self.width, self.height);
-        for x in 0..self.width {
-            for y in 0..self.height {
-                let u16_pixel = gradient.get_pixel(x, y);
-                let channels = u16_pixel.channels4();
-                let u8_pixel = image::Luma::from_channels(
-                    channels.0 as u8,
-                    channels.1 as u8,
-                    channels.2 as u8,
-                    channels.3 as u8,
-                );
-                tmp_gradient.put_pixel(x, y, u8_pixel);
-            }
-        }
-        let mut gradient = image::ImageRgb8(image::ImageLuma8(tmp_gradient).to_rgb());
-        gradient.invert();
-
-        // add all layers together
-        let mut final_image = DynamicImage::new_rgb8(self.width, self.height);
-        for x in 0..self.width {
-            for y in 0..self.height {
-                    let final_pixel_color = imageproc::pixelops::weighted_sum(
-                        colors.get_pixel(x, y),
-                        gradient.get_pixel(x, y),
-                        0.9,
-                        0.1,
-                    );
-                final_image.put_pixel(x, y, final_pixel_color)
-            }
-        }
-        final_image
+        colors
     }
 }
 
 fn main() {
     let scene = Scene {
-        width: 7680,
-        height: 4320,
+        width: 1920,
+        height: 1080,
         fov: 45.0,
         objects: vec![
             // black sphere
@@ -679,7 +607,7 @@ fn main() {
                     material: Material {
                         color: Color::new(0.529411764706, 0.807843137255, 0.980392156863),
                         emission: Color::black(),
-                        material_type: MaterialType::Coat,
+                        material_type: MaterialType::Diffuse,
                     },
                     edge_size: 0.015,
                 },
@@ -699,11 +627,11 @@ fn main() {
             Object::Sphere(
                 // light
                 Sphere {
-                    center: Vector3::new(0.0, 10.0, -10.0),
+                    center: Vector3::new(1.0, -1.1, 0.0),
                     radius: 1.0,
                     material: Material {
-                        color: Color::white() * 0.2,
-                        emission: Color::new(1.0, 1.0, 1.0),
+                        color: Color::black(),
+                        emission: Color::white() * 12.0,
                         material_type: MaterialType::Diffuse,
                     },
                     edge_size: 0.0,
@@ -713,12 +641,13 @@ fn main() {
         lights: vec![
             Light::DistantLight(DistantLight {
                 color: Color::white(),
-                direction: Vector3::new(1.5, -5.0, -5.0).normalize(),
-                intensity: 1.0,
+                direction: Vector3::new(-1.5, 0.0, -5.0).normalize(),
+                intensity: 6.0,
             }),
         ],
         samples: 512,
         bias: 0.0001,
+        max_depth: 0,
     };
     println!("Starting Renderer.");
     let now = Instant::now();
